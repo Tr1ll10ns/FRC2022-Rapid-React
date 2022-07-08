@@ -1,5 +1,10 @@
 package frc.robot.commands;
 
+import com.pathplanner.lib.PathPlannerTrajectory;
+import edu.wpi.first.math.geometry.Pose2d;
+import edu.wpi.first.math.geometry.Rotation2d;
+import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
+import edu.wpi.first.wpilibj2.command.Command;
 import edu.wpi.first.wpilibj2.command.InstantCommand;
 import edu.wpi.first.wpilibj2.command.SequentialCommandGroup;
 import edu.wpi.first.wpilibj2.command.WaitCommand;
@@ -7,10 +12,10 @@ import frc.robot.log.BucketLog;
 import frc.robot.log.LogLevel;
 import frc.robot.log.Loggable;
 import frc.robot.log.Put;
-import frc.robot.subsystem.AutonomousSubsystem;
-import frc.robot.subsystem.DrivetrainSubsystem;
-import frc.robot.subsystem.IntakeSubsystem;
-import frc.robot.subsystem.ShooterSubsystem;
+import frc.robot.subsystem.*;
+import frc.robot.utils.AutonomousPath;
+
+import java.util.Optional;
 
 public class AutonomousCommand extends SequentialCommandGroup
 {
@@ -18,84 +23,144 @@ public class AutonomousCommand extends SequentialCommandGroup
     private DrivetrainSubsystem drive;
     private IntakeSubsystem intake;
     private ShooterSubsystem shooter;
+    private RGBSubsystem rgb;
 
     private final Loggable<String> state = BucketLog.loggable(Put.STRING, "auto/commandState");
 
-    public AutonomousCommand(AutonomousSubsystem auto, DrivetrainSubsystem drive, IntakeSubsystem intake, ShooterSubsystem shooter)
+    private Optional<Pose2d> initialPosition;
+
+    public AutonomousCommand(AutonomousSubsystem auto, DrivetrainSubsystem drive, IntakeSubsystem intake, ShooterSubsystem shooter, RGBSubsystem rgb)
     {
         this.auto = auto;
         this.drive = drive;
         this.intake = intake;
         this.shooter = shooter;
+        this.rgb = rgb;
+
+        this.initialPosition = Optional.empty();
     }
 
-    public AutonomousCommand executeShootPreload()
+    //Basic Commands
+    public AutoShootCommand getShootCommand(int ballCount, boolean top)
     {
-        this.addCommands(new InstantCommand(() -> this.shooter.spinUpTop())
-                .andThen(new WaitCommand(2)
-                        .andThen(() -> {
-                            this.shooter.turnOnFeeders();
-                            this.intake.ballManagementForward();
-                        }).andThen(new WaitCommand(2)
-                                .andThen(() -> {
-                                    this.shooter.stopShoot();
+        return new AutoShootCommand(this.shooter, this.intake, this.rgb)
+                .withParameters(ballCount, top);
+    }
 
-                                    this.shooter.turnOffFeeders();
-                                    this.intake.ballManagementBackward();
-                                }))));
+    public InstantCommand getDropIntakeCommand()
+    {
+        return this.actionToCommand((d, i, s) -> {
+            i.forceIntaking();
+            i.spinForward();
+            s.antiFeed();
+        });
+    }
+
+    public InstantCommand getSpinShooterCommand(boolean top)
+    {
+        return this.actionToCommand((d, i, s) -> {
+            if(top) s.spinUpTop();
+            else s.shootLow();
+        });
+    }
+
+    public SequentialCommandGroup getSpinShooterCommandWithDelay(boolean top, double delay)
+    {
+        return new WaitCommand(delay).andThen(this.getSpinShooterCommand(top));
+    }
+
+    //AutonomousCommand Builders
+
+    public AutonomousCommand shootOne(boolean top)
+    {
+        this.addCommands(
+                new InstantCommand(() -> this.intake.stopSpin())
+                .andThen(this.getShootCommand(1, top))
+                .andThen(new InstantCommand(() -> this.intake.spinForward()))
+        );
         return this;
     }
 
-    public AutonomousCommand executeDrivePath(String pathPlanner)
+    public AutonomousCommand shootTwo(boolean top)
     {
-        this.addCommands(new AutonomousFollowPathCommand(pathPlanner, this.auto, this.drive));
+        this.addCommands(
+                new InstantCommand(() -> this.intake.stopSpin())
+                .andThen(this.getShootCommand(2, top))
+                .andThen(new InstantCommand(() -> {
+                    this.intake.spinForward();
+                    this.shooter.antiFeed();
+                }))
+        );
         return this;
     }
 
-    public AutonomousCommand executeDrivePath(String pathPlanner, double delayBeforeStart)
+    public AutonomousCommand executeDrivePath(AutonomousPath path, double delay)
     {
-        this.addCommands(new WaitCommand(delayBeforeStart)
-                .andThen(new AutonomousFollowPathCommand(pathPlanner, this.auto, this.drive)));
+        return this.executeDrivePath(path.pathName, delay, null);
+    }
+
+    public AutonomousCommand executeDrivePath(AutonomousPath path, double delay, Command parallel)
+    {
+        return this.executeDrivePath(path.pathName, delay, parallel);
+    }
+
+    public AutonomousCommand executeDrivePath(String pathPlanner, double delay)
+    {
+        return this.executeDrivePath(pathPlanner, delay, null);
+    }
+
+    public AutonomousCommand executeDrivePath(String pathPlanner, double delay, Command parallel)
+    {
+        PathPlannerTrajectory t = this.auto.buildPath(pathPlanner);
+
+        SequentialCommandGroup drive = new WaitCommand(delay)
+                .andThen(new AutonomousFollowPathCommand(t, this.auto, this.drive, this.rgb));
+
+        if(parallel == null) this.addCommands(drive);
+        else this.addCommands(drive.alongWith(parallel));
+
+        if(this.initialPosition.isEmpty()) this.setInitialPosition(t);
         return this;
     }
 
-    public AutonomousCommand executeAction(SubsystemAction action)
+    public AutonomousCommand executeAction(SubsystemAction action, double delay)
     {
-        this.addCommands(this.actionToCommand(action));
-        return this;
-    }
-
-    public AutonomousCommand executeAction(SubsystemAction action, double delayBeforeStart)
-    {
-        this.addCommands(new WaitCommand(delayBeforeStart)
+        this.addCommands(new WaitCommand(delay)
                 .andThen(this.actionToCommand(action)));
         return this;
     }
 
-    public AutonomousCommand executeParallel(String pathPlanner, SubsystemAction action)
+    private void setInitialPosition(PathPlannerTrajectory trajectory)
     {
-        this.addCommands(
-                new AutonomousFollowPathCommand(pathPlanner, this.auto, this.drive)
-                        .alongWith(this.actionToCommand(action)));
-        return this;
+        PathPlannerTrajectory.PathPlannerState state = trajectory.getInitialState();
+
+        this.initialPosition = Optional.of(new Pose2d(
+                state.poseMeters.getTranslation(),
+                state.holonomicRotation
+        ));
+
+        SmartDashboard.putString("autonomous_initial_position", this.initialPosition.get().toString());
     }
 
-    public AutonomousCommand executeParallel(String pathPlanner, SubsystemAction action, double delayBeforeStart)
-    {
-        this.addCommands(new WaitCommand(delayBeforeStart)
-                        .andThen(
-                                new AutonomousFollowPathCommand(pathPlanner, this.auto, this.drive)
-                                        .alongWith(this.actionToCommand(action))));
-        return this;
-    }
-
-    public AutonomousCommand complete()
+    public AutonomousCommand stop()
     {
         this.addCommands(this.actionToCommand((d, i, s) -> {
-            d.stop();
+            d.stopSticky();
             i.stopSpin();
             s.disable();
         }));
+
+        //Set Odometry
+        Pose2d zeroPos = new Pose2d(0, 0, new Rotation2d(0));
+        if (this.initialPosition.isPresent()) {
+            //SmartDashboard.putString("/drivetrain/initial_path_position", this.initialPosition.get().toString());
+            this.drive.resetGyroWithOffset(this.initialPosition.orElse(zeroPos).getRotation());
+            this.drive.setOdometry(this.initialPosition.orElse(zeroPos));
+        }
+
+        SmartDashboard.putString("autonomous_initial_gyro_rot2d", this.drive.gyro.getRotation2d().toString());
+        SmartDashboard.putString("autonomous_initial_gyro_angle", String.valueOf(this.drive.gyro.getAngle()));
+
         return this;
     }
 

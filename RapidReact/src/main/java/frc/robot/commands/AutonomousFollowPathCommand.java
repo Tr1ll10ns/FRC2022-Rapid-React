@@ -1,8 +1,9 @@
 package frc.robot.commands;
 
-import com.pathplanner.lib.PathPlanner;
 import com.pathplanner.lib.PathPlannerTrajectory;
-import edu.wpi.first.math.geometry.Pose2d;
+import edu.wpi.first.math.controller.PIDController;
+import edu.wpi.first.math.controller.ProfiledPIDController;
+import edu.wpi.first.math.trajectory.TrapezoidProfile;
 import edu.wpi.first.wpilibj2.command.InstantCommand;
 import edu.wpi.first.wpilibj2.command.SequentialCommandGroup;
 import frc.robot.config.Config;
@@ -12,27 +13,64 @@ import frc.robot.log.Loggable;
 import frc.robot.log.Put;
 import frc.robot.subsystem.AutonomousSubsystem;
 import frc.robot.subsystem.DrivetrainSubsystem;
+import frc.robot.subsystem.RGBSubsystem;
 
 public class AutonomousFollowPathCommand extends SequentialCommandGroup
 {
     private final PathPlannerTrajectory trajectory;
     private AutonomousSubsystem auto;
     private DrivetrainSubsystem drive;
+    private RGBSubsystem rgb;
+    private Config.AutonomousConfig autoConfig;
 
     private final Loggable<String> state = BucketLog.loggable(Put.STRING, "auto/followPathState");
 
-    public AutonomousFollowPathCommand(String trajectoryPath, AutonomousSubsystem auto, DrivetrainSubsystem drive)
+    public AutonomousFollowPathCommand(PathPlannerTrajectory trajectory, AutonomousSubsystem auto, DrivetrainSubsystem drive, RGBSubsystem rgb)
     {
-        this.trajectory = trajectoryPath.equals(new Config().auto.nothingPath) ? PathPlanner.loadPath(trajectoryPath, 0, 0) : PathPlanner.loadPath(trajectoryPath, 0.5, 0.5);
+        this.autoConfig = new Config().auto;
+
+        this.trajectory = trajectory;
         this.auto = auto;
         this.drive = drive;
+        this.rgb = rgb;
 
-        this.addCommands(
-                this.setup(),
+        this.addCommands(this.setup(), this.createTrajectoryFollowerCommand(), this.setDown());
+    }
 
-                this.drive.drivetrainModel.createCommandForTrajectory(this.trajectory, this.drive, this.drive.kinematics),
+    private CustomPPSwerveControllerCommand createTrajectoryFollowerCommand()
+    {
+        PIDController xController = new PIDController(
+                this.autoConfig.pathXYPID.getKP(),
+                this.autoConfig.pathXYPID.getKI(),
+                this.autoConfig.pathXYPID.getKD()
+        );
 
-                this.printError()
+        PIDController yController = new PIDController(
+                this.autoConfig.pathXYPID.getKP(),
+                this.autoConfig.pathXYPID.getKI(),
+                this.autoConfig.pathXYPID.getKD()
+        );
+
+        ProfiledPIDController thetaController = new ProfiledPIDController(
+                this.autoConfig.pathThetaPID.getKP(),
+                this.autoConfig.pathThetaPID.getKI(),
+                this.autoConfig.pathThetaPID.getKD(),
+                new TrapezoidProfile.Constraints(
+                        this.drive.getMaxAngularVelocity(), //Angular Velocity
+                        this.drive.getMaxAngularVelocity() * 10.0) //Angular Acceleration
+        );
+
+        thetaController.enableContinuousInput(-Math.PI, Math.PI);
+
+        return new CustomPPSwerveControllerCommand(
+                this.trajectory, //Trajectory
+                () -> this.drive.odometry.getPoseMeters(), //Robot Pose supplier
+                this.drive.kinematics, //Swerve Drive Kinematics
+                xController, //PID Controller: X
+                yController, //PID Controller: Y
+                thetaController, //PID Controller: Θ
+                this.drive::setStates, //SwerveModuleState setter
+                this.drive
         );
     }
 
@@ -40,26 +78,19 @@ public class AutonomousFollowPathCommand extends SequentialCommandGroup
     {
         return new InstantCommand(() ->{
             this.state.log(LogLevel.GENERAL, "Starting to Follow a Trajectory!");
-            this.drive.drivetrainModel.resetPID(this.trajectory.getInitialPose().getRotation().getRadians());
-            this.drive.setOdometry(this.trajectory.getInitialPose());
-            this.drive.field.setRobotPose(this.trajectory.getInitialPose());
-            //this.drive.gyro.setAngle(this.trajectory.getInitialPose().getRotation());
-            //this.drive.drivetrainModel.setKnownPose(this.trajectory.getInitialPose());
 
-            this.drive.field.getObject("Trajectory").setTrajectory(this.trajectory);
-
-            this.drive.zeroStates(this.trajectory.getInitialPose());
+            this.rgb.autoDriving();
         });
     }
 
-    private InstantCommand printError()
+    private InstantCommand setDown()
     {
         return new InstantCommand(() -> {
-            Pose2d actualEnd = this.drive.field.getRobotPose();
-            Pose2d targetEnd = this.trajectory.getEndState().poseMeters;
+            this.state.log(LogLevel.GENERAL, "Finished Following a Trajectory!");
 
-            double distance = Math.pow(Math.pow(actualEnd.getX() - targetEnd.getX(), 2) + Math.pow(actualEnd.getY() - targetEnd.getY(), 2), 0.5);
-            this.state.log(LogLevel.GENERAL, "Completed following a Trajectory! Distance Error from Target: " + distance);
+            this.drive.stopSticky();
+
+            this.rgb.autoNotDriving();
         });
     }
 }
